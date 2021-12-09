@@ -1,0 +1,668 @@
+#import <Foundation/Foundation.h>
+
+#import <AVFoundation/AVFoundation.h>
+#import <CoreMedia/CMTime.h>
+
+
+typedef void(^PDVideoEditorExportComplete)(NSString *mediaPath, NSError *error);
+@interface PDVideoEditor : NSObject
+
+// Set these properties before building the composition objects.
+@property (nonatomic, copy) NSArray *clips; // array of AVURLAssets
+@property (nonatomic, copy) NSArray *clipTimeRanges; // array of CMTimeRanges stored in NSValues.
+@property (nonatomic) CMTime transitionDuration;
+
+@property (nonatomic, readonly, retain) AVMutableComposition *composition;
+@property (nonatomic, readonly, retain) AVMutableVideoComposition *videoComposition;
+@property (nonatomic, readonly, retain) AVMutableAudioMix *audioMix;
+
+// Builds the composition and videoComposition
+- (void)buildCompositionObjectsForPlayback;
+
+- (void)exportWithCompletionBlock:(PDVideoEditorExportComplete)completeBlock export_progress_block:(void (^)(CGFloat progress))progress_block;
+
+- (AVPlayerItem *)playerItem;
+
+
+@end
+
+#import "PDVideoEditor.h"
+
+#import "PDFileHelper.h"
+
+typedef void (^ export_progress_block) (CGFloat progress);
+
+@interface PDVideoEditor ()
+{
+    NSTimer *_timer;
+    CGFloat _width;
+    CGFloat _height;
+}
+
+@property (nonatomic, readwrite, retain) AVMutableComposition *composition;
+@property (nonatomic, readwrite, retain) AVMutableVideoComposition *videoComposition;
+@property (nonatomic, readwrite, retain) AVMutableAudioMix *audioMix;
+
+/** 导出会话 */
+@property (nonatomic, strong)     AVAssetExportSession *exportSession;
+
+/** 导出进度block */
+@property (nonatomic, copy) export_progress_block export_block;
+
+@end
+
+@implementation PDVideoEditor
+
+
+- (void)buildTransitionComposition:(AVMutableComposition *)composition andVideoComposition:(AVMutableVideoComposition *)videoComposition andAudioMix:(AVMutableAudioMix *)audioMix
+{
+    CMTime nextClipStartTime = kCMTimeZero;
+    NSInteger i = 0;
+    NSUInteger clipsCount = [self.clips count];
+    
+    if (clipsCount == 0) {
+        return ;
+    }
+    // 用于判断视频资源是否有音轨
+    BOOL hasAudioTrack = NO;
+    // 确保最后合并后的视频，不会超过最小的长度。
+    CMTime transitionDuration = self.transitionDuration;
+    for (i = 0; i < clipsCount; i++ ) {
+        NSValue *clipTimeRange = [self.clipTimeRanges objectAtIndex:i];
+        if (clipTimeRange) {
+            CMTime halfClipDuration = [clipTimeRange CMTimeRangeValue].duration;
+            halfClipDuration.timescale *= 2; // You can halve a rational by doubling its denominator.
+            transitionDuration = CMTimeMinimum(transitionDuration, halfClipDuration);
+        }
+        AVURLAsset *asset = [self.clips objectAtIndex:i];
+        if([asset tracksWithMediaType:AVMediaTypeAudio].count != 0) hasAudioTrack = YES;
+    }
+    
+    // Add two video tracks and two audio tracks.
+    AVMutableCompositionTrack *compositionVideoTracks[2];
+    AVMutableCompositionTrack *compositionAudioTracks[2];
+    compositionVideoTracks[0] = [composition addMutableTrackWithMediaType:AVMediaTypeVideo preferredTrackID:kCMPersistentTrackID_Invalid]; // 添加视频轨道0
+    compositionVideoTracks[1] = [composition addMutableTrackWithMediaType:AVMediaTypeVideo preferredTrackID:kCMPersistentTrackID_Invalid]; // 添加视频轨道1
+    
+    // 如果该视频中有音频轨道，则添加音轨到AVComposition中
+    if (hasAudioTrack) {
+        compositionAudioTracks[0] = [composition addMutableTrackWithMediaType:AVMediaTypeAudio preferredTrackID:kCMPersistentTrackID_Invalid]; // 添加音频轨道0
+        compositionAudioTracks[1] = [composition addMutableTrackWithMediaType:AVMediaTypeAudio preferredTrackID:kCMPersistentTrackID_Invalid]; // 添加音频轨道1
+    }
+    
+    CMTimeRange *passThroughTimeRanges = malloc(sizeof(CMTimeRange) * clipsCount);
+    CMTimeRange *transitionTimeRanges = malloc(sizeof(CMTimeRange) * clipsCount);
+    
+    // Place clips into alternating video & audio tracks in composition, overlapped by transitionDuration.
+    for (i = 0; i < clipsCount; i++ ) {
+        NSInteger alternatingIndex = i % 2; // alternating targets: 0, 1, 0, 1, ...
+        AVURLAsset *asset = [self.clips objectAtIndex:i];
+        NSValue *clipTimeRange = [self.clipTimeRanges objectAtIndex:i];
+        CMTimeRange timeRangeInAsset;
+        if (clipTimeRange) {
+            timeRangeInAsset = [clipTimeRange CMTimeRangeValue];
+        }
+        else {
+            timeRangeInAsset = CMTimeRangeMake(kCMTimeZero, [asset duration]);
+        }
+        
+        AVAssetTrack *clipVideoTrack = [[asset tracksWithMediaType:AVMediaTypeVideo] objectAtIndex:0];
+        NSError* error;
+        [compositionVideoTracks[alternatingIndex] insertTimeRange:timeRangeInAsset ofTrack:clipVideoTrack atTime:nextClipStartTime error:&error];
+        
+        
+        if ([asset tracksWithMediaType:AVMediaTypeAudio].count != 0) {
+            AVAssetTrack *clipAudioTrack = [[asset tracksWithMediaType:AVMediaTypeAudio] objectAtIndex:0];
+            [compositionAudioTracks[alternatingIndex] insertTimeRange:timeRangeInAsset ofTrack:clipAudioTrack atTime:nextClipStartTime error:&error];
+        }
+        
+//        PDLog(@"add at %lf long %lf", CMTimeGetSeconds(timeRangeInAsset.start) + CMTimeGetSeconds(nextClipStartTime), CMTimeGetSeconds(timeRangeInAsset.duration));
+        
+        // 计算应该直接播放的区间
+        // 从播放区间里面去掉变换区间
+        passThroughTimeRanges[i] = CMTimeRangeMake(nextClipStartTime, timeRangeInAsset.duration);
+        if (i > 0) {
+            passThroughTimeRanges[i].start = CMTimeAdd(passThroughTimeRanges[i].start, transitionDuration);
+            passThroughTimeRanges[i].duration = CMTimeSubtract(passThroughTimeRanges[i].duration, transitionDuration);
+        }
+        if (i+1 < clipsCount) {
+            passThroughTimeRanges[i].duration = CMTimeSubtract(passThroughTimeRanges[i].duration, transitionDuration);
+        }
+//        PDLog(@"passthrough at %lf long %lf", CMTimeGetSeconds(passThroughTimeRanges[i].start), CMTimeGetSeconds(passThroughTimeRanges[i].duration));
+        // 计算下一个插入点
+        nextClipStartTime = CMTimeAdd(nextClipStartTime, timeRangeInAsset.duration); // 加上持续时间
+        nextClipStartTime = CMTimeSubtract(nextClipStartTime, transitionDuration); // 减去变换时间，得到下一个插入点
+        
+        // 第i个视频的变换时间为下一个的插入点，长度为变换时间
+        if (i+1 < clipsCount) {
+            transitionTimeRanges[i] = CMTimeRangeMake(nextClipStartTime, transitionDuration);
+        }
+//        PDLog(@"transitionTimeRanges at %lf long %lf", CMTimeGetSeconds(transitionTimeRanges[i].start), CMTimeGetSeconds(transitionTimeRanges[i].duration));
+    }
+    
+    
+    NSMutableArray *instructions = [NSMutableArray array]; // 视频操作指令集合
+    NSMutableArray<AVAudioMixInputParameters *> *trackMixArray = [NSMutableArray<AVAudioMixInputParameters *> array]; // 音频操作指令集合
+    
+    for (i = 0; i < clipsCount; i++ ) {
+        NSInteger alternatingIndex = i % 2; // 轨道索引
+        AVURLAsset *asset = [self.clips objectAtIndex:i];
+
+        AVMutableVideoCompositionInstruction *passThroughInstruction = [AVMutableVideoCompositionInstruction videoCompositionInstruction]; // 新建指令
+        passThroughInstruction.timeRange = passThroughTimeRanges[i]; // 直接播放
+        AVMutableVideoCompositionLayerInstruction *passThroughLayer = [AVMutableVideoCompositionLayerInstruction videoCompositionLayerInstructionWithAssetTrack:compositionVideoTracks[alternatingIndex]]; // 视频轨道操作指令
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        CGAffineTransform t1;
+        CGAffineTransform existingTransform;
+        if (![passThroughLayer getTransformRampForTime:[self.composition duration] startTransform:&existingTransform endTransform:NULL timeRange:NULL]) {
+            t1 = CGAffineTransformMakeTranslation((composition.naturalSize.width / 2 - asset.naturalSize.width/2), (composition.naturalSize.height / 2 - asset.naturalSize.height / 2));
+            [passThroughLayer setTransform:t1 atTime:kCMTimeZero];
+        } else {
+            t1 = CGAffineTransformMakeTranslation((composition.naturalSize.height / 2 - asset.naturalSize.height / 2), (composition.naturalSize.width / 2 - asset.naturalSize.width/2));
+            CGAffineTransform newTransform = CGAffineTransformConcat(existingTransform, t1);
+            [passThroughLayer setTransform:newTransform atTime:kCMTimeZero];
+        }
+#pragma clang diagnostic pop
+
+        
+        passThroughInstruction.layerInstructions = [NSArray arrayWithObject:passThroughLayer];
+        [instructions addObject:passThroughInstruction]; // 添加到指令集合
+        
+        if (i+1 < clipsCount) { // 不是最后一个
+            AVMutableVideoCompositionInstruction *transitionInstruction = [AVMutableVideoCompositionInstruction videoCompositionInstruction]; // 新建指令
+            transitionInstruction.timeRange = transitionTimeRanges[i]; // 变换时间
+            AVMutableVideoCompositionLayerInstruction *fromLayer = [AVMutableVideoCompositionLayerInstruction videoCompositionLayerInstructionWithAssetTrack:compositionVideoTracks[alternatingIndex]]; // 视频轨道操作指令
+           
+            AVMutableVideoCompositionLayerInstruction *toLayer = [AVMutableVideoCompositionLayerInstruction videoCompositionLayerInstructionWithAssetTrack:compositionVideoTracks[1-alternatingIndex]]; // 新的轨道指令
+            // 目的轨道，从0到1
+            [toLayer setOpacityRampFromStartOpacity:0.0 toEndOpacity:1.0 timeRange:transitionTimeRanges[i]];
+            transitionInstruction.layerInstructions = [NSArray arrayWithObjects:toLayer, fromLayer, nil];
+            [instructions addObject:transitionInstruction];
+            if ([asset tracksWithMediaType:AVMediaTypeAudio].count != 0) {
+                AVMutableAudioMixInputParameters *trackMix1 = [AVMutableAudioMixInputParameters audioMixInputParametersWithTrack:compositionAudioTracks[alternatingIndex]]; // 音轨0的参数
+                
+                [trackMix1 setVolumeRampFromStartVolume:1.0 toEndVolume:0.0 timeRange:transitionTimeRanges[i]]; // 音轨0，变换期间音量从1.0到0.0
+                
+                [trackMixArray addObject:trackMix1];
+                
+                AVMutableAudioMixInputParameters *trackMix2 = [AVMutableAudioMixInputParameters audioMixInputParametersWithTrack:compositionAudioTracks[1 - alternatingIndex]]; // 音轨1的参数
+                
+                [trackMix2 setVolumeRampFromStartVolume:0.0 toEndVolume:1.0 timeRange:transitionTimeRanges[i]]; // 变换期间音量从0.0到1.0
+                [trackMix2 setVolumeRampFromStartVolume:1.0 toEndVolume:1.0 timeRange:passThroughTimeRanges[i + 1]]; // 播放期间音量 一直为1.0
+                
+                [trackMixArray addObject:trackMix2];
+            }
+        }
+        
+    }
+    
+    audioMix.inputParameters = trackMixArray;
+    videoComposition.instructions = instructions;
+}
+
+- (void)buildCompositionObjectsForPlayback
+{
+    if ( (self.clips == nil) || [self.clips count] == 0 ) {
+        self.composition = nil;
+        self.videoComposition = nil;
+        return;
+    }
+    
+    NSMutableArray *widthArrM = [NSMutableArray arrayWithCapacity:0];
+    NSMutableArray *heightArrM = [NSMutableArray arrayWithCapacity:0];
+    [self.clips enumerateObjectsUsingBlock:^(id  _Nonnull obj, NSUInteger idx, BOOL * _Nonnull stop) {
+        CGSize videoSize = [obj naturalSize];
+        [widthArrM addObject:@(videoSize.width)];
+        [heightArrM addObject:@(videoSize.height)];
+    }];
+    
+    [widthArrM sortUsingComparator:^NSComparisonResult(id  _Nonnull obj1, id  _Nonnull obj2) {
+        return [obj1 floatValue] < [obj2 floatValue];
+    }];
+    
+    [heightArrM sortUsingComparator:^NSComparisonResult(id  _Nonnull obj1, id  _Nonnull obj2) {
+        return [obj1 floatValue] < [obj2 floatValue];
+    }];
+    
+    _width = [widthArrM.lastObject floatValue];
+    _height = [heightArrM.lastObject floatValue];
+    AVMutableComposition *composition = [AVMutableComposition composition];
+    AVMutableVideoComposition *videoComposition = nil;
+    AVMutableAudioMix *audioMix = nil;
+    
+    composition.naturalSize = CGSizeMake(_width, _height);
+    videoComposition = [AVMutableVideoComposition videoComposition];
+    audioMix = [AVMutableAudioMix audioMix];
+    
+    [self buildTransitionComposition:composition andVideoComposition:videoComposition andAudioMix:audioMix];
+    
+    if (videoComposition) {
+        // 通用属性
+        videoComposition.frameDuration = CMTimeMake(1, 30); // 30 fps
+        videoComposition.renderSize = CGSizeMake(_width, _height);
+    }
+    
+    self.composition = composition;
+    self.videoComposition = videoComposition;
+    self.audioMix = audioMix;
+}
+
+- (void)exportWithCompletionBlock:(PDVideoEditorExportComplete)completeBlock export_progress_block:(void (^)(CGFloat progress))progress_block
+{
+    NSString *filePath = [Cache_PATH_IN_DOMAINS stringByAppendingPathComponent:@"temp.mp4"];
+    unlink([filePath UTF8String]);
+
+    self.exportSession = [[AVAssetExportSession alloc] initWithAsset:self.composition presetName:AVAssetExportPreset1280x720];
+    self.exportSession.videoComposition = self.videoComposition;
+    self.exportSession.audioMix = self.audioMix;
+    self.exportSession.outputURL = [NSURL fileURLWithPath:filePath];
+    self.exportSession.outputFileType = AVFileTypeQuickTimeMovie;
+    
+    if (progress_block) {
+        self.export_block = progress_block;
+    }
+    
+    [self.exportSession exportAsynchronouslyWithCompletionHandler:^(void){
+        switch (self.exportSession.status) {
+            case AVAssetExportSessionStatusUnknown:
+                PDLog(@"export AVAssetExportSessionStatusUnknown");
+                break;
+            case AVAssetExportSessionStatusWaiting:
+                PDLog(@"export AVAssetExportSessionStatusWaiting");
+                break;
+            case AVAssetExportSessionStatusExporting:
+                PDLog(@"export AVAssetExportSessionStatusExporting");
+                break;
+            case AVAssetExportSessionStatusCompleted:
+            {
+                PDLog(@"export AVAssetExportSessionStatusCompleted");
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    completeBlock(filePath,nil);
+                });
+                break;
+            }
+            case AVAssetExportSessionStatusFailed:
+            {
+                PDLog(@"export AVAssetExportSessionStatusFailed");
+                PDLog(@"Export failed: %@", [[self.exportSession error] localizedDescription]);
+                [_timer invalidate];
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    completeBlock(nil,self.exportSession.error);
+                });
+                break;
+            }
+            case AVAssetExportSessionStatusCancelled:
+                PDLog(@"export AVAssetExportSessionStatusCancelled");
+                break;
+            default:
+                break;
+        }
+    }];
+    
+    
+    _timer = [NSTimer scheduledTimerWithTimeInterval:0.3f
+                                             target:self
+                                           selector:@selector(retrievingSampleProgress)
+                                           userInfo:nil
+                                            repeats:YES];
+}
+
+- (void)retrievingSampleProgress{
+    PDLog(@"导出进度   %.2f",self.exportSession.progress);
+    if (self.exportSession.progress >= 1.0) [_timer invalidate];
+    self.export_block(self.exportSession.progress);
+}
+
+- (AVPlayerItem *)playerItem
+{
+    AVPlayerItem *playerItem = [AVPlayerItem playerItemWithAsset:self.composition];
+    playerItem.videoComposition = self.videoComposition;
+    playerItem.audioMix = self.audioMix;
+    
+    return playerItem;
+}
+
+@end
+
+/**
+ 根据媒体资源压缩成15秒的视频，avsset不能nil；时间最小要大于15秒。
+ 
+ **/
+#import <Foundation/Foundation.h>
+#import <AVFoundation/AVFoundation.h>
+#import <CoreMedia/CMTime.h>
+
+typedef void(^PDVideoEditorExportComplete)(NSString *mediaPath, NSError *error);
+
+@interface PDVideoComposionEditor : NSObject
+
+@property (nonatomic, readonly, retain) AVMutableComposition *composition;
+@property (nonatomic, readonly, retain) AVMutableVideoComposition *videoComposition;
+@property (nonatomic, readonly, retain) AVMutableAudioMix *audioMix;
+
+-(instancetype)initWithAVAsset:(AVAsset*)asset;
+// Builds the composition and videoComposition
+- (void)buildCompositionBlock:(PDVideoEditorExportComplete)completer;
+
+/**
+ 快速压缩成15秒视频
+ 
+ @param asset 资源
+ @param completer 结果；包括视频压缩后保存的路径
+ @return 结果
+ */
++(instancetype)compositionWithAVAsset:(AVAsset*)asset withBlock:(PDVideoEditorExportComplete)completer;
+
+@end
+
+#import "PDVideoComposionEditor.h"
+
+
+#define Cache_PATH_IN_DOMAINS1 [NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES) lastObject]
+
+typedef void (^ export_progress_block) (CGFloat progress);
+
+
+@interface PDVideoComposionEditor()
+{
+    CGFloat _width;
+    CGFloat _height;
+}
+// Set these properties before building the composition objects.
+@property (nonatomic, copy) NSArray *clips; // array of AVURLAssets
+@property (nonatomic, copy) NSArray *clipTimeRanges; // array of CMTimeRanges stored in NSValues.
+@property (nonatomic) CMTime transitionDuration;
+
+@property (nonatomic, readwrite, retain) AVMutableComposition *composition;
+@property (nonatomic, readwrite, retain) AVMutableVideoComposition *videoComposition;
+@property (nonatomic, readwrite, retain) AVMutableAudioMix *audioMix;
+
+/** 导出会话 */
+@property (nonatomic, strong)     AVAssetExportSession *exportSession;
+
+/** 导出进度block */
+@property (nonatomic, copy) export_progress_block export_block;
+
+@end
+
+@implementation PDVideoComposionEditor
+
+
++(instancetype)compositionWithAVAsset:(AVAsset*)asset withBlock:(PDVideoEditorExportComplete)completer
+{
+    PDVideoComposionEditor *editer = [[PDVideoComposionEditor alloc] initWithAVAsset:asset];
+    [editer buildCompositionBlock:completer];
+    return editer;
+}
+
+
+-(instancetype)initWithAVAsset:(AVAsset*)asset
+{
+    self = [super init];
+    if (self) {
+        _clips = [NSArray arrayWithObject:asset];
+        CMTimeRange  clipTimeRange = CMTimeRangeMake(kCMTimeZero, asset.duration);
+        NSValue *value = [NSValue valueWithCMTimeRange:clipTimeRange];
+        _clipTimeRanges = [NSArray arrayWithObject:value];
+        
+    }
+    return self;
+}
+
+- (void)buildTransitionComposition:(AVMutableComposition *)composition andVideoComposition:(AVMutableVideoComposition *)videoComposition andAudioMix:(AVMutableAudioMix *)audioMix
+{
+    CMTime nextClipStartTime = kCMTimeZero;
+    NSInteger i = 0;
+    NSUInteger clipsCount = [self.clips count];
+    
+    if (clipsCount == 0) {
+        return ;
+    }
+    // 用于判断视频资源是否有音轨
+    BOOL hasAudioTrack = NO;
+    // 确保最后合并后的视频，不会超过最小的长度。
+    CMTime transitionDuration = self.transitionDuration;
+    for (i = 0; i < clipsCount; i++ ) {
+        NSValue *clipTimeRange = [self.clipTimeRanges objectAtIndex:i];
+        if (clipTimeRange) {
+            CMTime halfClipDuration = [clipTimeRange CMTimeRangeValue].duration;
+            halfClipDuration.timescale *= 2; // You can halve a rational by doubling its denominator.
+            transitionDuration = CMTimeMinimum(transitionDuration, halfClipDuration);
+        }
+        AVURLAsset *asset = [self.clips objectAtIndex:i];
+        if([asset tracksWithMediaType:AVMediaTypeAudio].count != 0) hasAudioTrack = YES;
+    }
+    
+    // Add two video tracks and two audio tracks.
+    AVMutableCompositionTrack *compositionVideoTracks[2];
+    AVMutableCompositionTrack *compositionAudioTracks[2];
+    compositionVideoTracks[0] = [composition addMutableTrackWithMediaType:AVMediaTypeVideo preferredTrackID:kCMPersistentTrackID_Invalid]; // 添加视频轨道0
+    compositionVideoTracks[1] = [composition addMutableTrackWithMediaType:AVMediaTypeVideo preferredTrackID:kCMPersistentTrackID_Invalid]; // 添加视频轨道1
+    
+    // 如果该视频中有音频轨道，则添加音轨到AVComposition中
+    if (hasAudioTrack) {
+        compositionAudioTracks[0] = [composition addMutableTrackWithMediaType:AVMediaTypeAudio preferredTrackID:kCMPersistentTrackID_Invalid]; // 添加音频轨道0
+        compositionAudioTracks[1] = [composition addMutableTrackWithMediaType:AVMediaTypeAudio preferredTrackID:kCMPersistentTrackID_Invalid]; // 添加音频轨道1
+    }
+    
+    CMTimeRange *passThroughTimeRanges = malloc(sizeof(CMTimeRange) * clipsCount);
+    CMTimeRange *transitionTimeRanges = malloc(sizeof(CMTimeRange) * clipsCount);
+    
+    // Place clips into alternating video & audio tracks in composition, overlapped by transitionDuration.
+    for (i = 0; i < clipsCount; i++ ) {
+        NSInteger alternatingIndex = i % 2; // alternating targets: 0, 1, 0, 1, ...
+        AVURLAsset *asset = [self.clips objectAtIndex:i];
+        NSValue *clipTimeRange = [self.clipTimeRanges objectAtIndex:i];
+        CMTimeRange timeRangeInAsset;
+        if (clipTimeRange) {
+            timeRangeInAsset = [clipTimeRange CMTimeRangeValue];
+        }
+        else {
+            timeRangeInAsset = CMTimeRangeMake(kCMTimeZero, [asset duration]);
+        }
+        
+        AVAssetTrack *clipVideoTrack = [[asset tracksWithMediaType:AVMediaTypeVideo] objectAtIndex:0];
+        NSError* error;
+        [compositionVideoTracks[alternatingIndex] insertTimeRange:timeRangeInAsset ofTrack:clipVideoTrack atTime:nextClipStartTime error:&error];
+#pragma mark =压缩15秒视频=
+        CMTimeRange timeRangeSpped = CMTimeRangeMake(kCMTimeZero, asset.duration);
+        float speed = CMTimeGetSeconds(asset.duration);
+        ///大于15才压缩
+        if (speed > 15) {
+            speed = 15/speed;
+            [compositionVideoTracks[alternatingIndex] scaleTimeRange:timeRangeSpped toDuration:CMTimeMake(asset.duration.value * speed, asset.duration.timescale)];
+        }
+        
+        if ([asset tracksWithMediaType:AVMediaTypeAudio].count != 0) {
+            AVAssetTrack *clipAudioTrack = [[asset tracksWithMediaType:AVMediaTypeAudio] objectAtIndex:0];
+            [compositionAudioTracks[alternatingIndex] insertTimeRange:timeRangeInAsset ofTrack:clipAudioTrack atTime:nextClipStartTime error:&error];
+        }
+        
+        //        PDLog(@"add at %lf long %lf", CMTimeGetSeconds(timeRangeInAsset.start) + CMTimeGetSeconds(nextClipStartTime), CMTimeGetSeconds(timeRangeInAsset.duration));
+        
+        // 计算应该直接播放的区间
+        // 从播放区间里面去掉变换区间
+        passThroughTimeRanges[i] = CMTimeRangeMake(nextClipStartTime, timeRangeInAsset.duration);
+        if (i > 0) {
+            passThroughTimeRanges[i].start = CMTimeAdd(passThroughTimeRanges[i].start, transitionDuration);
+            passThroughTimeRanges[i].duration = CMTimeSubtract(passThroughTimeRanges[i].duration, transitionDuration);
+        }
+        if (i+1 < clipsCount) {
+            passThroughTimeRanges[i].duration = CMTimeSubtract(passThroughTimeRanges[i].duration, transitionDuration);
+        }
+        //        PDLog(@"passthrough at %lf long %lf", CMTimeGetSeconds(passThroughTimeRanges[i].start), CMTimeGetSeconds(passThroughTimeRanges[i].duration));
+        // 计算下一个插入点
+        nextClipStartTime = CMTimeAdd(nextClipStartTime, timeRangeInAsset.duration); // 加上持续时间
+        nextClipStartTime = CMTimeSubtract(nextClipStartTime, transitionDuration); // 减去变换时间，得到下一个插入点
+        
+        // 第i个视频的变换时间为下一个的插入点，长度为变换时间
+        if (i+1 < clipsCount) {
+            transitionTimeRanges[i] = CMTimeRangeMake(nextClipStartTime, transitionDuration);
+        }
+        //        PDLog(@"transitionTimeRanges at %lf long %lf", CMTimeGetSeconds(transitionTimeRanges[i].start), CMTimeGetSeconds(transitionTimeRanges[i].duration));
+    }
+    
+    
+    NSMutableArray *instructions = [NSMutableArray array]; // 视频操作指令集合
+    NSMutableArray<AVAudioMixInputParameters *> *trackMixArray = [NSMutableArray<AVAudioMixInputParameters *> array]; // 音频操作指令集合
+    
+    for (i = 0; i < clipsCount; i++ ) {
+        NSInteger alternatingIndex = i % 2; // 轨道索引
+        AVURLAsset *asset = [self.clips objectAtIndex:i];
+        
+        AVMutableVideoCompositionInstruction *passThroughInstruction = [AVMutableVideoCompositionInstruction videoCompositionInstruction]; // 新建指令
+        passThroughInstruction.timeRange = passThroughTimeRanges[i]; // 直接播放
+        AVMutableVideoCompositionLayerInstruction *passThroughLayer = [AVMutableVideoCompositionLayerInstruction videoCompositionLayerInstructionWithAssetTrack:compositionVideoTracks[alternatingIndex]]; // 视频轨道操作指令
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        CGAffineTransform t1;
+        CGAffineTransform existingTransform;
+        if (![passThroughLayer getTransformRampForTime:[self.composition duration] startTransform:&existingTransform endTransform:NULL timeRange:NULL]) {
+            t1 = CGAffineTransformMakeTranslation((composition.naturalSize.width / 2 - asset.naturalSize.width/2), (composition.naturalSize.height / 2 - asset.naturalSize.height / 2));
+            [passThroughLayer setTransform:t1 atTime:kCMTimeZero];
+        } else {
+            t1 = CGAffineTransformMakeTranslation((composition.naturalSize.height / 2 - asset.naturalSize.height / 2), (composition.naturalSize.width / 2 - asset.naturalSize.width/2));
+            CGAffineTransform newTransform = CGAffineTransformConcat(existingTransform, t1);
+            [passThroughLayer setTransform:newTransform atTime:kCMTimeZero];
+        }
+#pragma clang diagnostic pop
+        
+        
+        passThroughInstruction.layerInstructions = [NSArray arrayWithObject:passThroughLayer];
+        [instructions addObject:passThroughInstruction]; // 添加到指令集合
+        
+        if (i+1 < clipsCount) { // 不是最后一个
+            AVMutableVideoCompositionInstruction *transitionInstruction = [AVMutableVideoCompositionInstruction videoCompositionInstruction]; // 新建指令
+            transitionInstruction.timeRange = transitionTimeRanges[i]; // 变换时间
+            AVMutableVideoCompositionLayerInstruction *fromLayer = [AVMutableVideoCompositionLayerInstruction videoCompositionLayerInstructionWithAssetTrack:compositionVideoTracks[alternatingIndex]]; // 视频轨道操作指令
+            
+            AVMutableVideoCompositionLayerInstruction *toLayer = [AVMutableVideoCompositionLayerInstruction videoCompositionLayerInstructionWithAssetTrack:compositionVideoTracks[1-alternatingIndex]]; // 新的轨道指令
+            // 目的轨道，从0到1
+            [toLayer setOpacityRampFromStartOpacity:0.0 toEndOpacity:1.0 timeRange:transitionTimeRanges[i]];
+            transitionInstruction.layerInstructions = [NSArray arrayWithObjects:toLayer, fromLayer, nil];
+            [instructions addObject:transitionInstruction];
+            if ([asset tracksWithMediaType:AVMediaTypeAudio].count != 0) {
+                AVMutableAudioMixInputParameters *trackMix1 = [AVMutableAudioMixInputParameters audioMixInputParametersWithTrack:compositionAudioTracks[alternatingIndex]]; // 音轨0的参数
+                
+                [trackMix1 setVolumeRampFromStartVolume:1.0 toEndVolume:0.0 timeRange:transitionTimeRanges[i]]; // 音轨0，变换期间音量从1.0到0.0
+                
+                [trackMixArray addObject:trackMix1];
+                
+                AVMutableAudioMixInputParameters *trackMix2 = [AVMutableAudioMixInputParameters audioMixInputParametersWithTrack:compositionAudioTracks[1 - alternatingIndex]]; // 音轨1的参数
+                
+                [trackMix2 setVolumeRampFromStartVolume:0.0 toEndVolume:1.0 timeRange:transitionTimeRanges[i]]; // 变换期间音量从0.0到1.0
+                [trackMix2 setVolumeRampFromStartVolume:1.0 toEndVolume:1.0 timeRange:passThroughTimeRanges[i + 1]]; // 播放期间音量 一直为1.0
+                
+                [trackMixArray addObject:trackMix2];
+            }
+        }
+        
+    }
+    
+    audioMix.inputParameters = trackMixArray;
+    videoComposition.instructions = instructions;
+}
+
+
+- (void)buildCompositionBlock:(PDVideoEditorExportComplete)completer
+{
+    if ( (self.clips == nil) || [self.clips count] == 0 ) {
+        self.composition = nil;
+        self.videoComposition = nil;
+        return;
+    }
+    
+    AVAsset *t_asset = [self.clips firstObject];
+    CGSize videoSize = [t_asset naturalSize];
+    _width = videoSize.width;
+    _height = videoSize.height;
+    AVMutableComposition *composition = [AVMutableComposition composition];
+    AVMutableVideoComposition *videoComposition = nil;
+    AVMutableAudioMix *audioMix = nil;
+    
+    composition.naturalSize = CGSizeMake(_width, _height);
+    videoComposition = [AVMutableVideoComposition videoComposition];
+    audioMix = [AVMutableAudioMix audioMix];
+    
+    [self buildTransitionComposition:composition andVideoComposition:videoComposition andAudioMix:audioMix];
+    if (videoComposition) {
+        // 通用属性
+        videoComposition.frameDuration = CMTimeMake(1, 30); // 30 fps
+        videoComposition.renderSize = CGSizeMake(_width, _height);
+    }
+    self.composition = composition;
+    self.videoComposition = videoComposition;
+    self.audioMix = audioMix;
+    
+    
+    [self exportWithCompletionBlock:completer export_progress_block:nil];
+    
+}
+
+- (void)exportWithCompletionBlock:(PDVideoEditorExportComplete)completeBlock export_progress_block:(void (^)(CGFloat progress))progress_block
+{
+    NSString *filePath = [Cache_PATH_IN_DOMAINS1 stringByAppendingPathComponent:@"gdu1video1temp.mp4"];
+    if ([[NSFileManager defaultManager] isExecutableFileAtPath:filePath]) {
+        [[NSFileManager defaultManager] removeItemAtPath:filePath error:nil];
+    }
+    unlink([filePath UTF8String]);
+    
+    self.exportSession = [[AVAssetExportSession alloc] initWithAsset:self.composition presetName:AVAssetExportPreset1280x720];
+    self.exportSession.videoComposition = self.videoComposition;
+    self.exportSession.audioMix = self.audioMix;
+    self.exportSession.outputURL = [NSURL fileURLWithPath:filePath];
+    self.exportSession.outputFileType = AVFileTypeQuickTimeMovie;
+    
+    if (progress_block) {
+        self.export_block = progress_block;
+    }
+    
+    [self.exportSession exportAsynchronouslyWithCompletionHandler:^(void){
+        switch (self.exportSession.status) {
+            case AVAssetExportSessionStatusUnknown:
+                NSLog(@"export AVAssetExportSessionStatusUnknown");
+                break;
+            case AVAssetExportSessionStatusWaiting:
+                NSLog(@"export AVAssetExportSessionStatusWaiting");
+                break;
+            case AVAssetExportSessionStatusExporting:
+                NSLog(@"export AVAssetExportSessionStatusExporting");
+                break;
+            case AVAssetExportSessionStatusCompleted:
+            {
+                NSLog(@"export AVAssetExportSessionStatusCompleted");
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    completeBlock(filePath,nil);
+                });
+                break;
+            }
+            case AVAssetExportSessionStatusFailed:
+            {
+                NSLog(@"export AVAssetExportSessionStatusFailed");
+                NSLog(@"Export failed: %@", [[self.exportSession error] localizedDescription]);
+                
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    completeBlock(nil,self.exportSession.error);
+                });
+                break;
+            }
+            case AVAssetExportSessionStatusCancelled:
+            {
+                NSLog(@"export AVAssetExportSessionStatusCancelled");
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    completeBlock(nil,self.exportSession.error);
+                });
+            }
+                break;
+            default:
+                break;
+        }
+    }];
+    
+    
+}
+
+
+
+@end
